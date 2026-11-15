@@ -214,11 +214,10 @@ impl Modprobe {
     }
 
     fn block(&mut self, args: &[String]) {
-        if args[0] == "blocklist"
-            && args.len() == 2
-            && let Some(module) = canonical(&args[1])
-        {
-            self.blocklist.insert(module);
+        if args[0] == "blocklist" && args.len() == 2 {
+            if let Some(module) = canonical(&args[1]) {
+                self.blocklist.insert(module);
+            }
         }
     }
 
@@ -348,10 +347,10 @@ impl Modprobe {
     pub fn load_listed(&mut self) -> Vec<(String, anyhow::Error)> {
         let mut failed = Vec::new();
         for name in self.listed.clone() {
-            if let Err(e) = self.load(&name)
-                && !self.is_blocklisted(&name)
-            {
-                failed.push((name, e));
+            if let Err(e) = self.load(&name) {
+                if !self.is_blocklisted(&name) {
+                    failed.push((name, e));
+                }
             }
         }
         failed

@@ -14,7 +14,6 @@ pub mod store;
 pub mod switch;
 
 pub use state::{State, Who};
-pub use switch::Held;
 
 /// What the pages show of the systems.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,8 +29,6 @@ pub struct Overview {
     /// system was installed: its vendor_boot or its dtbo, which the other
     /// system starts with too.
     pub changed: bool,
-    /// What the boot partitions hold, set against what is kept of them.
-    pub held: Held,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

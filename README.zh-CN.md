@@ -90,12 +90,17 @@ Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 
 ### 🚧 施工中
 
-这些机型的镜像按照各自的原厂固件构建，还没有在真机上试过。屏幕、触摸、WLAN 和振动已经配置好。解密 data 分区所需的程序由 Skyward 在手机上从已安装系统的 init 脚本和服务描述中读出，每个机型的读取结果都用原厂固件核对过，这些程序在这些机型上的运行情况还没有验证。
+这些适配仍在施工中。REDMI K60 Pro（`socrates`）已实刷 `recovery_a`，验证 PIN 可写 data 解密、Wi-Fi、Windows MTP 文件操作，以及专用共享存储和应用私有 CE 目录中的生产代码备份恢复；此前的显示、触摸、USB ADB、按键、亮度、振动和槽位查询验证也已记录。原生 ext4/F2FS 格式化、挂载和擦除在一次性 loop 镜像上通过。测试后已恢复原 recovery、卸载测试包并清理测试文件。具体构建与未验证范围见[实机验证记录](devices/socrates-validation.json)。
+
+机主确认 K60 Pro 当前移植系统的底包为 **OS3.0.303.0.WMKCNXM**。宿主框架实测为 **Android 17／API 37**；当前 vendor/odm 属性自报 **OS3.0.304.0.WMKCNXM、Android 13／API 33（VNDK 33）**。recovery 的构建输入另为官方 **Android 16 OTA OS3.0.304.0.WMKCNXM**。底包、框架、厂商层自报属性和打包来源分别记录，不把属性或构建输入当作整机底包版本；其他组合尚未验证。
+
+REDMI K90 Pro Max（`myron`）实测基准为 **OS4.0.6.0.XPMCNXM，Android 17／API 37 框架、Android 16／API 36 厂商层**。原生 recovery 启动、触摸、正确 PIN／CE 与可写 data、逻辑分区挂载开关、热点扫描及物理控制均已通过。官方整包安装及修正后的 recovery 保留接口重试通过，返回 HyperOS 后机主确认正常解锁及原文件正常。MTP 删除后 Windows WPD 枚举阻塞、metadata 快照回退和 OTA 进度提前显示仍待修；详见 [myron 验证记录](devices/myron.md)。除上述两款外，下表其余机型尚未实机验证，不会解密 data。
 
 | 机型 | 代号 | 构建所用的系统版本 |
 | --- | --- | --- |
 | 🚧 小米 13 | `fuxi` | OS3.0.309.0.WMCCNXM（Android 16） |
 | 🚧 小米 13 Pro | `nuwa` | OS3.0.312.0.WMBCNXM（Android 16） |
+| 🚧 REDMI K60 Pro | `socrates` | OS3.0.304.0.WMKCNXM（Android 16） |
 | 🚧 小米 14 | `houji` | OS3.0.307.0.WNCCNXM（Android 16） |
 | 🚧 小米 14 Pro | `shennong` | OS3.0.309.0.WNBCNXM（Android 16） |
 | 🚧 小米 14 Ultra | `aurora` | OS3.0.308.0.WNACNXM（Android 16） |
@@ -109,7 +114,7 @@ Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 | 🚧 REDMI K80 | `zorn` | OS3.0.309.0.WOKCNXM（Android 16） |
 | 🚧 REDMI K80 Pro | `miro` | OS3.0.305.0.WOMCNXM（Android 16） |
 | 🚧 REDMI K90 | `annibale` | OS3.0.307.0.WPKCNXM（Android 16） |
-| 🚧 REDMI K90 Pro Max | `myron` | OS4.0.4.0.XPMCNXM（Android 17） |
+| 🚧 REDMI K90 Pro Max | `myron` | OS4.0.6.0.XPMCNXM（Android 17） |
 | 🚧 REDMI K90 Ultra | `warsaw` | OS3.0.309.0.WHPCNXM（Android 16） |
 | 🚧 REDMI K100 Pro | `athens` | OS4.0.4.0.XPICNXM（Android 17） |
 | 🚧 REDMI K100 Pro Max | `songyuan` | OS4.0.4.0.XGNCNXM（Android 17） |
@@ -119,8 +124,8 @@ Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 Skyward 需要已解锁的 bootloader。从 [Releases](https://github.com/kirklin/skyward/releases) 下载对应机型的 zip，每个文件都标有机型和代号，例如 Xiaomi 17 Ultra (nezha)。使用 `SHA256SUMS` 核对并解压之后，在手机处于 fastboot 模式的时候，把其中的镜像刷入当前运行槽位的 recovery 分区：
 
 ```sh
-unzip skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.zip
-fastboot flash recovery skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.img
+unzip skyward-v0.2.0-nezha-OS4.0.4.0.XPACNXM.zip
+fastboot flash recovery skyward-v0.2.0-nezha-OS4.0.4.0.XPACNXM.img
 fastboot reboot recovery
 ```
 
@@ -149,7 +154,7 @@ Skyward 可以在手机自身分区中的系统旁边安装第二系统，主系
 
 ## 构建
 
-Skyward 使用 `rust-toolchain.toml` 指定版本的 Rust 和它的 `aarch64-linux-android` 目标、Android NDK r29 和 [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) 构建。recovery 服务针对手机构建，打包工具针对电脑构建：
+Skyward 使用 `rust-toolchain.toml` 指定的稳定版 Rust 和它的 `aarch64-linux-android` 目标、Android NDK r29 和 [cargo-ndk](https://github.com/bbqsrc/cargo-ndk) 构建。recovery 服务针对手机构建，打包工具针对电脑构建：
 
 ```sh
 cargo ndk -t arm64-v8a --platform 30 build --release -p skyward
@@ -187,13 +192,7 @@ target/release/skyward-pack recovery \
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo ndk -t arm64-v8a --platform 30 clippy --workspace --all-targets -- -D warnings
-```
-
-名称以 `on_the_phone` 开头的测试会创建文件系统、挂载分区、设置加密密钥，这些操作只有手机能够完成。把一台已经进入 Skyward、数据分区已经打开的手机通过 adb 连接到电脑，`cargo ndk` 会把每个测试程序推送到手机上运行，测试逐个执行：
-
-```sh
-cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward-files -p skyward-mtp on_the_phone -- --test-threads=1
+cargo ndk -t arm64-v8a --platform 30 clippy -p skyward -p skyward-install -p skyward-systems -p skyward-system-init -- -D warnings
 ```
 
 `skyward-preview` 无需手机，在电脑上把页面绘制成 PNG 文件：每个页面完整绘制成长截图的样子，覆盖它可能处于的各种状态，另外还有触摸和动画过程中某些时刻的屏幕。`--lang` 按照地区代码选择语言，例如 `en` 或者 `zh-TW`：

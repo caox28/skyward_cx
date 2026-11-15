@@ -7,7 +7,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod avb;
-mod described;
 
 use skyward_bootimg::{BootImage, Ramdisk};
 
@@ -68,6 +67,14 @@ enum Cmd {
         /// The monospaced typeface's licence, which goes with it.
         #[arg(long)]
         mono_license: PathBuf,
+        /// Extra service libraries, stored under /skyward/lib64 by basename.
+        /// Only services naming that folder in their library search use them.
+        #[arg(long)]
+        library: Vec<PathBuf>,
+        /// Development-only myron tracing. Writes bounded logs to a new
+        /// directory on metadata only if it is already mounted read/write.
+        #[arg(long)]
+        myron_diagnostics: bool,
         #[arg(long)]
         out: PathBuf,
     },
@@ -84,25 +91,6 @@ enum Cmd {
         /// Where to write the stock recovery image.
         #[arg(long)]
         out: Option<PathBuf>,
-    },
-    /// Take what a device's own partitions say of the programs they carry
-    /// out of its stock build's full update package on its server: the
-    /// init scripts, the service descriptions, the accounts and the build
-    /// properties of each partition that carries such programs, written
-    /// under `out` as the partition and then the path in it. Only the
-    /// parts of the package that hold these files are downloaded, each
-    /// checked against the package's own sum of it.
-    Described {
-        /// The device configuration, devices/<codename>.toml.
-        #[arg(long)]
-        config: PathBuf,
-        /// A partition to take them out of; vendor, odm and system_ext
-        /// when none is named.
-        #[arg(long = "partition")]
-        partitions: Vec<String>,
-        /// The folder to write the files under, which is not there yet.
-        #[arg(long)]
-        out: PathBuf,
     },
 }
 
@@ -125,7 +113,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, library, myron_diagnostics, out } => {
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
@@ -135,7 +123,12 @@ fn main() -> Result<()> {
                 anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
-            skyward_config::DeviceConfig::load(&config)?;
+            let cfg = skyward_config::DeviceConfig::load(&config)?;
+            for replacement in cfg.services.iter().flat_map(|s| &s.library_overrides) {
+                let name = Path::new(&replacement.source).file_name().context("a library override needs a basename")?;
+                ensure!(library.iter().any(|p| p.file_name().is_some_and(|n| n == name)),
+                    "the profile requires --library pointing to {}", name.to_string_lossy());
+            }
             rd.replace(paths::RECOVERY, read(&binary)?)?;
             // Install scripts look for the commands a stock recovery lacks
             // among its programs, and its unzip there too, a link to ziptool
@@ -149,6 +142,20 @@ fn main() -> Result<()> {
             rd.add(paths::FONT, 0o644, read(&font)?)?;
             rd.add(paths::MONO, 0o644, read(&mono)?)?;
             rd.add(paths::MONO_LICENSE, 0o644, read(&mono_license)?)?;
+            for file in library {
+                let name = file.file_name().and_then(|n| n.to_str()).with_context(|| format!("{} has no library filename", file.display()))?;
+                rd.add(&format!("skyward/lib64/{name}"), 0o644, read(&file)?)?;
+            }
+            if myron_diagnostics {
+                ensure!(cfg.device.codename == "myron", "--myron-diagnostics is only for myron");
+                rd.add("skyward/myron-diagnostics.sh", 0o755, include_bytes!("myron-diagnostics.sh").to_vec())?;
+                rd.add("init.skyward-myron-diagnostics.rc", 0o644, include_bytes!("myron-diagnostics.rc").to_vec())?;
+                let init = "system/etc/init/hw/init.rc";
+                let original = &rd.find(init).with_context(|| format!("{init} is not in the ramdisk"))?.data;
+                let mut traced = b"import /init.skyward-myron-diagnostics.rc\n".to_vec();
+                traced.extend_from_slice(original);
+                rd.replace(init, traced)?;
+            }
             // A stock ramdisk may run logd without any scheduling profiles,
             // and logd stops as soon as it cannot find the one it asks for.
             if rd.find(paths::TASK_PROFILES).is_none() {
@@ -165,8 +172,7 @@ fn main() -> Result<()> {
                 .find(paths::PROP_DEFAULT)
                 .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
                 .data;
-            let mut props = without(stock_props, &BUILD_VERSION);
-            props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+            let props = recovery_properties(stock_props, cfg.decrypt.preserves_keys());
             rd.replace(paths::PROP_DEFAULT, props)?;
             img.ramdisk = rd.encode()?;
             let bytes = img.to_bytes()?;
@@ -179,11 +185,6 @@ fn main() -> Result<()> {
                 Some(out) => take_stock_recovery(&stock, &out),
                 None => Ok(()),
             }
-        }
-        Cmd::Described { config, partitions, out } => {
-            let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
-            let partitions = if partitions.is_empty() { skyward_programs::phone::PARTITIONS.map(str::to_string).to_vec() } else { partitions };
-            described::take(&stock.package, &partitions, &out)
         }
     }
 }
@@ -212,7 +213,7 @@ fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> 
     };
     let taken = payload.extract(&options, &report).with_context(|| format!("take {RECOVERY} out of {}", stock.package))?;
     let image = taken.iter().find(|i| i.partition == RECOVERY).with_context(|| format!("{} holds no {RECOVERY} partition", stock.package))?;
-    let sum = hex::encode(image.sha256.as_deref().context("the package's own sum of the image was not checked")?);
+    let sum: String = image.sha256.as_deref().context("the package's own sum of the image was not checked")?.iter().map(|b| format!("{b:02x}")).collect();
     ensure!(sum == stock.recovery, "the {RECOVERY} partition in {} has the SHA-256 {sum}, where the configuration names {}", stock.package, stock.recovery);
     std::fs::rename(&image.path, out).with_context(|| format!("move {} to {}", image.path.display(), out.display()))?;
     println!("wrote {} ({} bytes), its SHA-256 the one the configuration names", out.display(), image.size);
@@ -245,6 +246,20 @@ fn partition_size(stock: &Path) -> Result<usize> {
 /// they say the wrong one, so they are left out here for the recovery to
 /// fill in from the installed system once it has that mounted.
 const BUILD_VERSION: [&str; 3] = ["ro.build.version.release", "ro.build.version.security_patch", "ro.vendor.build.security_patch"];
+
+/// Stock vold may discard metadata keys if they cannot be opened. A key-
+/// preserving image must leave them intact, even when data is writable.
+const DELETE_METADATA_KEYS: &str = "ro.crypto.metadata_init_delete_all_keys.enabled";
+
+fn recovery_properties(stock_props: &[u8], preserve_keys: bool) -> Vec<u8> {
+    let mut props = without(stock_props, &BUILD_VERSION);
+    props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+    if preserve_keys {
+        props = without(&props, &[DELETE_METADATA_KEYS]);
+        props.extend_from_slice(format!("{DELETE_METADATA_KEYS}=false\n").as_bytes());
+    }
+    props
+}
 
 /// The scheduling profiles a recovery's programs look up by name. A
 /// recovery's cgroup setup mounts no controllers, so of all a system's
@@ -304,6 +319,36 @@ fn list(image: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_decryption_never_requests_metadata_key_deletion() {
+        let stock = format!("{DELETE_METADATA_KEYS}=true\nro.build.version.release=13\nro.vndk.version=33\n");
+        let disabled = format!("{DELETE_METADATA_KEYS}=false");
+        let enabled = format!("{DELETE_METADATA_KEYS}=true");
+        let diagnostic = String::from_utf8(recovery_properties(stock.as_bytes(), true)).unwrap();
+        assert!(diagnostic.lines().any(|l| l == disabled));
+        assert!(!diagnostic.lines().any(|l| l == enabled));
+        assert!(diagnostic.contains("ro.vndk.version=33\n"));
+        let normal = String::from_utf8(recovery_properties(stock.as_bytes(), false)).unwrap();
+        assert!(normal.lines().any(|l| l == enabled));
+    }
+
+    #[test]
+    fn writable_key_preserving_decryption_also_disables_metadata_key_deletion() {
+        let stock = format!("{DELETE_METADATA_KEYS}=true\nro.vndk.version=33\n");
+        let disabled = format!("{DELETE_METADATA_KEYS}=false");
+        let enabled = format!("{DELETE_METADATA_KEYS}=true");
+        let policy = skyward_config::Decrypt { read_only: false, auto_repair: false, key_upgrades: false, storage_key_renewal: false };
+        let props = String::from_utf8(recovery_properties(stock.as_bytes(), policy.preserves_keys())).unwrap();
+        assert!(props.lines().any(|line| line == disabled));
+        assert!(!props.lines().any(|line| line == enabled));
+        let storage = skyward_config::Decrypt { read_only: true, storage_key_renewal: true, ..policy };
+        let props = String::from_utf8(recovery_properties(stock.as_bytes(), storage.preserves_keys())).unwrap();
+        assert!(props.lines().any(|line| line == disabled));
+        assert!(!props.lines().any(|line| line == enabled));
+        let legacy = String::from_utf8(recovery_properties(stock.as_bytes(), skyward_config::Decrypt::default().preserves_keys())).unwrap();
+        assert!(legacy.lines().any(|line| line == enabled));
+    }
 
     #[test]
     fn the_lines_that_set_a_name_are_the_only_ones_left_out() {

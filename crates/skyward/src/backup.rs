@@ -11,10 +11,13 @@ use skyward_vab::{Slot, SnapshotState};
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// The most often how far the work has come is told.
@@ -177,58 +180,82 @@ pub enum End {
 }
 
 pub struct Worker {
+    events: Receiver<Event>,
+    /// Readable while events wait.
+    wake: OwnedFd,
     cancel: Arc<AtomicBool>,
-    /// The screen lets it go once the work has ended.
-    worker: skyward_sys::worker::Worker<Event>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Worker {
     pub fn start(task: Task) -> Result<Worker> {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error()).context("make the backup worker's wake pipe");
+        }
+        let (wake, signal) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (tx, events) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
-        let worker = skyward_sys::worker::Worker::start("backup", move |teller| {
-            let tell = |event: Event| {
-                teller.tell(event);
-            };
-            let ended = match task {
-                Task::Backup(t) => backup(t, &tell, &stop).map(End::Saved),
-                Task::Restore(t) => restore(t, &tell, &stop).map(|unmade| End::Restored { unmade }),
-            };
-            let end = match ended {
-                Ok(end) => end,
-                Err(e) if e.is::<Cancelled>() => End::Stopped,
-                Err(e) => match e.downcast::<Refusal>() {
-                    Ok(refusal) => End::Refused(refusal),
-                    Err(e) => End::Failed(format!("{e:#}")),
-                },
-            };
-            let said = match &end {
-                End::Saved(folder) => format!("backup saved in {}", folder.display()),
-                End::Restored { unmade } => format!("backup restored, all but {unmade:?}"),
-                End::Stopped => "backup stopped".into(),
-                End::Refused(why) => format!("backup refused: {why}"),
-                End::Failed(why) => format!("backup failed: {why}"),
-            };
-            skyward_sys::kmsg(&said).expect("the kernel log takes a line");
-            tell(Event::Ended(end));
-        })?;
-        Ok(Worker { cancel, worker })
+        let thread = thread::Builder::new()
+            .name("backup".into())
+            .spawn(move || {
+                let tell = |event: Event| {
+                    // The screen only stops listening once it has let the
+                    // worker go.
+                    let _ = tx.send(event);
+                    unsafe { libc::write(signal.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+                };
+                let ended = match task {
+                    Task::Backup(t) => backup(t, &tell, &stop).map(End::Saved),
+                    Task::Restore(t) => restore(t, &tell, &stop).map(|unmade| End::Restored { unmade }),
+                };
+                let end = match ended {
+                    Ok(end) => end,
+                    Err(e) if e.is::<Cancelled>() => End::Stopped,
+                    Err(e) => match e.downcast::<Refusal>() {
+                        Ok(refusal) => End::Refused(refusal),
+                        Err(e) => End::Failed(format!("{e:#}")),
+                    },
+                };
+                let said = match &end {
+                    End::Saved(folder) => format!("backup saved in {}", folder.display()),
+                    End::Restored { unmade } => format!("backup restored, all but {unmade:?}"),
+                    End::Stopped => "backup stopped".into(),
+                    End::Refused(why) => format!("backup refused: {why}"),
+                    End::Failed(why) => format!("backup failed: {why}"),
+                };
+                skyward_sys::kmsg(&said).expect("the kernel log takes a line");
+                tell(Event::Ended(end));
+            })
+            .context("start the backup worker")?;
+        Ok(Worker { events, wake, cancel, thread: Some(thread) })
     }
 
-    /// Readable while events wait.
     pub fn fd(&self) -> RawFd {
-        self.worker.fd()
+        self.wake.as_raw_fd()
     }
 
     /// The events since the last call.
     pub fn events(&self) -> Vec<Event> {
-        self.worker.events()
+        let mut drain = [0u8; 64];
+        while unsafe { libc::read(self.wake.as_raw_fd(), drain.as_mut_ptr().cast(), drain.len()) } > 0 {}
+        self.events.try_iter().collect()
     }
 
     /// Ask the work to stop; it does between two chunks, and a restore
     /// only while nothing is written yet.
     pub fn stop(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Worker {
+    /// The screen lets the worker go once its work has ended.
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the backup worker does not panic");
+        }
     }
 }
 
@@ -293,13 +320,18 @@ fn copy(from: &mut impl Read, to: &mut impl Write, len: u64, cancel: &AtomicBool
 /// with, in hex.
 fn data_key() -> Result<String> {
     let bytes = fs::read(DATA_KEY).with_context(|| format!("read {DATA_KEY}"))?;
-    Ok(hex::encode(bytes))
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The bytes free where `path` is, or would be made.
 fn free_bytes(path: &Path) -> Result<u64> {
     let there = path.ancestors().find(|p| p.exists()).context("the root is always there")?;
-    Ok(mount::space(there).with_context(|| format!("look at the room on {}", there.display()))?.available)
+    let c = std::ffi::CString::new(there.as_os_str().as_bytes()).with_context(|| format!("{} holds a NUL", there.display()))?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error()).with_context(|| format!("look at the room on {}", there.display()));
+    }
+    Ok(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 /// The slot's partitions in super are read or written whole only while no

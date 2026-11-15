@@ -15,9 +15,11 @@ use skyward_install::wipe::{self as package, Wipe};
 use skyward_install::Refusal;
 use skyward_sys::{bcb, prop};
 use skyward_vab::Slot;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
 
 /// Where e2fsck is put to run once the installed system it comes from is
 /// let go, as Android's own recovery puts it, with the libraries of its own
@@ -88,35 +90,59 @@ pub enum Event {
 }
 
 pub struct Worker {
-    /// The screen lets it go once the work has ended.
-    worker: skyward_sys::worker::Worker<Event>,
+    events: Receiver<Event>,
+    /// Readable while events wait.
+    wake: OwnedFd,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Worker {
-    pub fn start(task: Task) -> Result<Worker> {
-        let worker = skyward_sys::worker::Worker::start("partitions", move |teller| {
-            let mut tell = |event: Event| {
-                teller.tell(event);
-            };
-            let done = match task {
-                Task::Disable { package_size } => disable(package_size, &mut tell),
-                Task::Unshare { slot } => unshare(slot, &mut tell),
-                Task::Repair(part) => repair(part, &mut tell),
-                Task::Remake(part, filesystem) => remake(part, &filesystem, &mut tell),
-            };
-            tell(Event::Done(done));
-        })?;
-        Ok(Worker { worker })
+    pub fn start(task: Task, policy: skyward_config::Decrypt) -> Result<Worker> {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("make the partition worker's wake pipe");
+        }
+        let (wake, signal) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (tx, events) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("partitions".into())
+            .spawn(move || {
+                let mut tell = |event: Event| {
+                    // The screen only stops listening once it has let the
+                    // worker go.
+                    let _ = tx.send(event);
+                    unsafe { libc::write(signal.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+                };
+                let done = match task {
+                    Task::Disable { package_size } => disable(package_size, &mut tell),
+                    Task::Unshare { slot } => unshare(slot, &mut tell),
+                    Task::Repair(part) => repair(part, policy, &mut tell),
+                    Task::Remake(part, filesystem) => remake(part, &filesystem, &mut tell),
+                };
+                tell(Event::Done(done));
+            })
+            .context("start the partition worker")?;
+        Ok(Worker { events, wake, thread: Some(thread) })
     }
 
-    /// Readable while events wait.
     pub fn fd(&self) -> RawFd {
-        self.worker.fd()
+        self.wake.as_raw_fd()
     }
 
     /// The events since the last call.
     pub fn events(&self) -> Vec<Event> {
-        self.worker.events()
+        let mut drain = [0u8; 64];
+        while unsafe { libc::read(self.wake.as_raw_fd(), drain.as_mut_ptr().cast(), drain.len()) } > 0 {}
+        self.events.try_iter().collect()
+    }
+}
+
+impl Drop for Worker {
+    /// The screen lets the worker go once its work has ended.
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the partition worker does not panic");
+        }
     }
 }
 
@@ -264,10 +290,12 @@ fn copy_with_libraries(program: &Path) -> Result<PathBuf> {
 /// partition is closed first and reached through a mapping of its own,
 /// which goes again once the work is done; another partition is unmounted
 /// for it and mounted again read-only after.
-fn repair(part: Part, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
+fn repair(part: Part, policy: skyward_config::Decrypt, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
     tell(Event::Listed(vec![name(&part)]));
     tell(Event::At(0));
-    let done = reach(&part, |device| {
+    // This is an explicit repair request, independent of automatic fsck.
+    // Opening the storage key still follows the configured upgrade policy.
+    let done = reach(&part, policy, |device| {
         let filesystem = probe::filesystem(device)?.context("the partition holds no filesystem blkid knows")?;
         let (fixed, ran) = fsck::repair(device, &filesystem)?;
         Ok((Item::Fixed(fixed), ran.said))
@@ -304,11 +332,11 @@ fn name(part: &Part) -> String {
 
 /// Do `work` with the device the partition's filesystem is reached through,
 /// nothing mounted from it.
-fn reach<T>(part: &Part, work: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+fn reach<T>(part: &Part, policy: skyward_config::Decrypt, work: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     match part {
         Part::Data => {
             crate::wipe::release_data()?;
-            let mapped = crate::decrypt::with_key_service(data::map_unmounted).map_err(anyhow::Error::msg)?;
+            let mapped = crate::decrypt::with_key_service(policy, data::map_unmounted).map_err(anyhow::Error::msg)?;
             let done = work(&mapped);
             data::unmap()?;
             done
@@ -359,7 +387,7 @@ mod tests {
         };
 
         let mut told = Vec::new();
-        assert_eq!(repair(Part::Entry(entry), &mut |event| told.push(event)), Ok(()));
+        assert_eq!(repair(Part::Entry(entry), skyward_config::Decrypt::default(), &mut |event| told.push(event)), Ok(()));
 
         let [Event::Listed(names), Event::At(0), Event::Ended(0, item, said)] = &told[..] else {
             panic!("told {} events", told.len())

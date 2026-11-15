@@ -11,16 +11,16 @@ use skyward_net::iface;
 use skyward_net::reach::{self, Reach};
 use skyward_net::supplicant::{self, Bss, Control, Event as Told, Security};
 use skyward_net::wlan::{self, Joined, Link, Next, Power, Stage, Traffic, Wlan};
-use skyward_sys::worker::{self, Teller};
 use std::fs;
 use std::net::Ipv4Addr;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// The first folder the firmware loader looks in that a recovery can
@@ -90,11 +90,30 @@ enum Report {
 }
 
 pub struct Worker {
-    /// What the thread is asked, each of which wakes it.
-    inbox: Teller<Inbox>,
-    /// What the screen is told. The thread is waited for once it has been
-    /// asked to end.
-    worker: worker::Worker<Report>,
+    inbox: Sender<Inbox>,
+    /// Written to wake the thread when something is in its inbox.
+    poke: Arc<OwnedFd>,
+    told: Receiver<Report>,
+    /// Readable while the screen has something to be told.
+    wake: OwnedFd,
+    thread: Option<JoinHandle<()>>,
+}
+
+fn pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("make a pipe for the WLAN thread");
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+fn signal(fd: &OwnedFd) {
+    unsafe { libc::write(fd.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+}
+
+fn drain(fd: &OwnedFd) {
+    let mut buf = [0u8; 64];
+    while unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
 }
 
 impl Worker {
@@ -103,29 +122,43 @@ impl Worker {
     /// interface's libraries, and `servers` where the DNS servers the
     /// network gives are kept for whoever looks names up.
     pub fn start(cfg: Config, modules: Vec<PathBuf>, libraries: Option<PathBuf>, servers: Servers) -> Result<Worker> {
-        let (inbox, asked) = worker::telling().context("make the WLAN thread's inbox")?;
-        let back = inbox.clone();
-        let worker = worker::Worker::start("wlan", move |tell| {
-            let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, back, tell };
-            s.run(&asked);
-        })?;
-        Ok(Worker { inbox, worker })
+        let (inbox_tx, inbox) = mpsc::channel();
+        let (poked, poke) = pipe()?;
+        let (told_tx, told) = mpsc::channel();
+        let (wake, rung) = pipe()?;
+        let poke = Arc::new(poke);
+        let back = Back { inbox: inbox_tx.clone(), poke: poke.clone() };
+        let thread = thread::Builder::new()
+            .name("wlan".into())
+            .spawn(move || {
+                let tell = move |r: Report| {
+                    // The screen only stops listening once it has let the
+                    // worker go.
+                    let _ = told_tx.send(r);
+                    signal(&rung);
+                };
+                let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, back, tell: Box::new(tell) };
+                s.run(&inbox, &poked);
+            })
+            .context("start the WLAN thread")?;
+        Ok(Worker { inbox: inbox_tx, poke, told, wake, thread: Some(thread) })
     }
 
     pub fn send(&self, c: Command) {
-        self.inbox.tell(Inbox::Command(c));
+        let _ = self.inbox.send(Inbox::Command(c));
+        signal(&self.poke);
     }
 
-    /// Readable while the screen has something to be told.
     pub fn fd(&self) -> RawFd {
-        self.worker.fd()
+        self.wake.as_raw_fd()
     }
 
     /// How the WLAN stands now, and how fast data went over it in the last
     /// second, each if told since the last call.
     pub fn told(&self) -> (Option<Wlan>, Option<Traffic>) {
+        drain(&self.wake);
         let (mut wlan, mut traffic) = (None, None);
-        for report in self.worker.events() {
+        for report in self.told.try_iter() {
             match report {
                 Report::Wlan(w) => wlan = Some(w),
                 Report::Traffic(t) => traffic = Some(t),
@@ -138,8 +171,19 @@ impl Worker {
 impl Drop for Worker {
     /// The WLAN goes off with the thread.
     fn drop(&mut self) {
-        self.inbox.tell(Inbox::End);
+        if let Some(thread) = self.thread.take() {
+            let _ = self.inbox.send(Inbox::End);
+            signal(&self.poke);
+            thread.join().expect("the WLAN thread does not panic");
+        }
     }
+}
+
+/// What a thread asking for an address answers to.
+#[derive(Clone)]
+struct Back {
+    inbox: Sender<Inbox>,
+    poke: Arc<OwnedFd>,
 }
 
 /// The supplicant running, and the address the network gave.
@@ -200,17 +244,15 @@ struct Station {
     servers: Servers,
     state: Wlan,
     running: Option<Running>,
-    /// What a thread asking for an address, or looking how far the
-    /// network reaches, answers to: the thread's own inbox.
-    back: Teller<Inbox>,
-    tell: Teller<Report>,
+    back: Back,
+    tell: Box<dyn Fn(Report) + Send>,
 }
 
 impl Station {
-    fn run(&mut self, asked: &worker::Told<Inbox>) {
+    fn run(&mut self, inbox: &Receiver<Inbox>, poked: &OwnedFd) {
         let mut told = self.state.clone();
         loop {
-            let mut fds = vec![libc::pollfd { fd: asked.fd(), events: libc::POLLIN, revents: 0 }];
+            let mut fds = vec![libc::pollfd { fd: poked.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
             if let Some(r) = &self.running {
                 fds.push(libc::pollfd { fd: r.monitor.fd(), events: libc::POLLIN, revents: 0 });
             }
@@ -219,7 +261,8 @@ impl Station {
                 let e = std::io::Error::last_os_error();
                 assert_eq!(e.kind(), std::io::ErrorKind::Interrupted, "poll the WLAN thread's inputs: {e}");
             }
-            for message in asked.take() {
+            drain(poked);
+            for message in inbox.try_iter() {
                 match message {
                     Inbox::Command(c) => self.command(c),
                     Inbox::Address(n, answer) => self.addressed(n, answer),
@@ -231,7 +274,7 @@ impl Station {
             self.timers();
             if self.state != told {
                 told = self.state.clone();
-                self.tell.tell(Report::Wlan(told.clone()));
+                (self.tell)(Report::Wlan(told.clone()));
             }
         }
     }
@@ -268,10 +311,10 @@ impl Station {
             }
             Command::Leave => {
                 self.unaddress();
-                if let Some(r) = &self.running
-                    && let Err(e) = r.control.order("REMOVE_NETWORK all")
-                {
-                    self.lost(e);
+                if let Some(r) = &self.running {
+                    if let Err(e) = r.control.order("REMOVE_NETWORK all") {
+                        self.lost(e);
+                    }
                 }
                 self.state.joined = None;
             }
@@ -283,7 +326,7 @@ impl Station {
             return;
         }
         self.state.power = Power::Starting;
-        self.tell.tell(Report::Wlan(self.state.clone()));
+        (self.tell)(Report::Wlan(self.state.clone()));
         match self.start() {
             Ok(r) => {
                 self.running = Some(r);
@@ -407,10 +450,10 @@ impl Station {
             Next::Address => self.ask_address(),
             Next::Unaddress => self.unaddress(),
             Next::Forget => {
-                if let Some(r) = &self.running
-                    && let Err(e) = r.control.order("REMOVE_NETWORK all")
-                {
-                    self.lost(e);
+                if let Some(r) = &self.running {
+                    if let Err(e) = r.control.order("REMOVE_NETWORK all") {
+                        self.lost(e);
+                    }
                 }
             }
         }
@@ -436,7 +479,8 @@ impl Station {
                 None => dhcp::obtain(&interface, mac, &stop).map(Asked::Got),
                 Some((lease, phase)) => dhcp::keep(&interface, mac, &lease, phase > 0, &stop).map(Asked::Kept),
             };
-            back.tell(Inbox::Address(n, answer));
+            let _ = back.inbox.send(Inbox::Address(n, answer));
+            signal(&back.poke);
         });
     }
 
@@ -469,15 +513,15 @@ impl Station {
             }
         };
         let same = r.lease.as_ref().is_some_and(|h| (h.lease.address, h.lease.mask, h.lease.router) == (lease.address, lease.mask, lease.router));
-        if !same
-            && let Err(e) = iface::configure(&self.cfg.interface, lease.address, lease.mask, lease.router)
-        {
-            let _ = skyward_sys::kmsg(&format!("{e:#}"));
-            r.retry_at = Some(Instant::now() + RETRY);
-            if let Some(j) = &mut self.state.joined {
-                j.stage = Stage::NoAddress(format!("{e:#}"));
+        if !same {
+            if let Err(e) = iface::configure(&self.cfg.interface, lease.address, lease.mask, lease.router) {
+                let _ = skyward_sys::kmsg(&format!("{e:#}"));
+                r.retry_at = Some(Instant::now() + RETRY);
+                if let Some(j) = &mut self.state.joined {
+                    j.stage = Stage::NoAddress(format!("{e:#}"));
+                }
+                return;
             }
-            return;
         }
         let _ = skyward_sys::kmsg(&format!(
             "{} has {} ({}) through {:?} for {} s, kept again after {} s",
@@ -511,7 +555,8 @@ impl Station {
         let n = r.probed;
         thread::spawn(move || {
             let reach = reach::probe(&page, &dns);
-            back.tell(Inbox::Reach(n, reach));
+            let _ = back.inbox.send(Inbox::Reach(n, reach));
+            signal(&back.poke);
         });
     }
 
@@ -531,15 +576,15 @@ impl Station {
         if let Some((_, stop)) = r.asking.take() {
             stop.store(true, Ordering::Relaxed);
         }
-        if r.lease.take().is_some()
-            && let Err(e) = iface::unconfigure(&self.cfg.interface)
-        {
-            let _ = skyward_sys::kmsg(&format!("{e:#}"));
+        if r.lease.take().is_some() {
+            if let Err(e) = iface::unconfigure(&self.cfg.interface) {
+                let _ = skyward_sys::kmsg(&format!("{e:#}"));
+            }
         }
         // Nothing goes over a network left, and counting starts afresh on
         // the next one.
         if r.counted.take().is_some() {
-            self.tell.tell(Report::Traffic(Traffic::default()));
+            (self.tell)(Report::Traffic(Traffic::default()));
         }
         self.servers.lock().expect("the DNS servers are not held by a thread that panicked").clear();
     }
@@ -551,27 +596,27 @@ impl Station {
             r.retry_at = None;
             return self.ask_address();
         }
-        if r.asking.is_none()
-            && let Some(h) = &r.lease
-            && now >= h.due()
-        {
-            if h.phase >= 2 {
-                // The lease ran out with no server to keep it.
-                self.unaddress();
-                if let Some(j) = &mut self.state.joined {
-                    j.stage = Stage::Addressing;
+        if r.asking.is_none() {
+            if let Some(h) = &r.lease {
+                if now >= h.due() {
+                    if h.phase >= 2 {
+                        // The lease ran out with no server to keep it.
+                        self.unaddress();
+                        if let Some(j) = &mut self.state.joined {
+                            j.stage = Stage::Addressing;
+                        }
+                    }
+                    return self.ask_address();
                 }
             }
-            return self.ask_address();
         }
         if now >= r.polled_at + POLL {
             self.poll_link();
         }
-        if let Some(r) = &self.running
-            && r.lease.is_some()
-            && r.counted.is_none_or(|c| now >= c.at + TRAFFIC)
-        {
-            self.count(now);
+        if let Some(r) = &self.running {
+            if r.lease.is_some() && r.counted.is_none_or(|c| now >= c.at + TRAFFIC) {
+                self.count(now);
+            }
         }
     }
 
@@ -592,7 +637,7 @@ impl Station {
         if let Some(c) = r.counted {
             let secs = now.duration_since(c.at).as_secs_f64();
             let rate = |total: u64, before: u64| (total.saturating_sub(before) as f64 / secs).round() as u64;
-            self.tell.tell(Report::Traffic(Traffic { rx: rate(rx, c.rx), tx: rate(tx, c.tx) }));
+            (self.tell)(Report::Traffic(Traffic { rx: rate(rx, c.rx), tx: rate(tx, c.tx) }));
         }
         r.counted = Some(Counted { at: now, rx, tx });
     }
@@ -634,13 +679,25 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         for w in &cfg.writes {
             fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
         }
-        let until = Instant::now() + INTERFACE_WAIT;
-        while !net.exists() {
-            ensure!(Instant::now() < until, "the driver made no {} in {} seconds", cfg.interface, INTERFACE_WAIT.as_secs());
-            thread::sleep(Duration::from_millis(100));
-        }
     }
-    iface::set_up(&cfg.interface, true)
+    let until = Instant::now() + INTERFACE_WAIT;
+    loop {
+        if net.exists() {
+            match iface::set_up(&cfg.interface, true) {
+                Ok(()) => return Ok(()),
+                // Qualcomm publishes wlan0 before its probe releases the
+                // initialization lock. Retry that temporary refusal within
+                // the same deadline used to wait for the interface.
+                Err(error)
+                    if error.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error) == Some(libc::EBUSY)
+                        && Instant::now() < until => {}
+                Err(error) => return Err(error),
+            }
+        } else {
+            ensure!(Instant::now() < until, "the driver made no {} in {} seconds", cfg.interface, INTERFACE_WAIT.as_secs());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Put a file the driver asks for where the firmware loader looks.
@@ -649,17 +706,28 @@ fn place(file: &Firmware) -> Result<()> {
     let dir = to.parent().expect("a firmware file is in a folder");
     fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
     let bytes = match &file.partition {
-        None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
+        None => read_firmware(Path::new(&file.path), file.optional).with_context(|| format!("read {}", file.path))?,
         Some(partition) => {
             let at = Path::new(PARTITIONS).join(partition);
             fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
             skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join(partition), &at)?;
-            let read = fs::read(at.join(&file.path)).with_context(|| format!("read {} on {partition}", file.path));
+            let read = read_firmware(&at.join(&file.path), file.optional).with_context(|| format!("read {} on {partition}", file.path));
             skyward_block::mount::umount(&at)?;
             read?
         }
     };
-    fs::write(&to, bytes).with_context(|| format!("write {}", to.display()))
+    match bytes {
+        Some(bytes) => fs::write(&to, bytes).with_context(|| format!("write {}", to.display())),
+        None => skyward_sys::kmsg(&format!("optional firmware {} is absent", file.name)),
+    }
+}
+
+fn read_firmware(path: &Path, optional: bool) -> std::io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Start the supplicant on the interface, and wait for its control socket.

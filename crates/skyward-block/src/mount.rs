@@ -1,8 +1,3 @@
-use std::ffi::CString;
-use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
-
 /// Filesystems Android puts on logical and metadata partitions, in the order
 /// a device's fstab lists alternatives for one mount point.
 pub const FILESYSTEMS: [&str; 3] = ["erofs", "ext4", "f2fs"];
@@ -45,40 +40,33 @@ pub fn split_options(options: &[String]) -> (u64, String) {
     (flags, own.join(","))
 }
 
+/// Read the existing filesystem without replaying a journal or rolling a
+/// checkpoint forward. A read-only mount alone can still replay a log.
+pub fn read_only_options(filesystem: &str, options: &[String]) -> anyhow::Result<Vec<String>> {
+    let no_recovery = match filesystem {
+        "ext4" => Some("noload"),
+        "f2fs" => Some("norecovery"),
+        "erofs" => None,
+        _ => anyhow::bail!("read-only decryption does not support {filesystem}"),
+    };
+    let mut options: Vec<String> = options
+        .iter()
+        .filter(|o| !matches!(o.as_str(), "rw" | "ro" | "discard" | "recovery" | "norecovery" | "noload" | "load"))
+        .cloned()
+        .collect();
+    options.push("ro".into());
+    if let Some(no_recovery) = no_recovery {
+        options.push(no_recovery.into());
+    }
+    Ok(options)
+}
+
 /// The mount that shows at a mount point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Visible {
     /// (major, minor) of the mounted device.
     pub device: (u32, u32),
     pub filesystem: String,
-}
-
-/// The room in a filesystem, in bytes: all of it, what no file takes, and
-/// the part of that left for files other than the system's own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Space {
-    pub total: u64,
-    pub free: u64,
-    pub available: u64,
-}
-
-/// The room in the filesystem that holds `path`.
-pub fn space(path: &Path) -> io::Result<Space> {
-    let s = statvfs(path)?;
-    // The counts are 32 bits on some hosts and 64 on the phone.
-    #[allow(clippy::useless_conversion)]
-    let (blocks, free, available, size) = (u64::from(s.f_blocks), u64::from(s.f_bfree), u64::from(s.f_bavail), u64::from(s.f_frsize));
-    Ok(Space { total: blocks * size, free: free * size, available: available * size })
-}
-
-/// What the kernel says of the filesystem that holds `path`.
-fn statvfs(path: &Path) -> io::Result<libc::statvfs> {
-    let c = CString::new(path.as_os_str().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(s)
 }
 
 #[cfg(target_os = "android")]
@@ -109,14 +97,17 @@ mod sys {
     }
 
     /// Mount `device` read-only at `target` with the first of [`FILESYSTEMS`]
-    /// the kernel accepts, and return its name. Only the kernel's answers for
-    /// "not this filesystem" move on to the next one.
+    /// the kernel accepts, without journal replay or checkpoint recovery,
+    /// and return its name. Only the kernel's answers for "not this
+    /// filesystem" move on to the next one.
     pub fn mount_ro(device: &Path, target: &Path) -> Result<&'static str> {
         let (src, dst) = (cstr(device)?, cstr(target)?);
         let mut refused = Vec::new();
         for fs in FILESYSTEMS {
             let ty = CString::new(fs).expect("filesystem names hold no NUL");
-            if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), libc::MS_RDONLY, null()) } == 0 {
+            let (flags, own) = super::split_options(&super::read_only_options(fs, &[])?);
+            let data = CString::new(own).expect("fixed filesystem options hold no NUL");
+            if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), flags as libc::c_ulong, data.as_ptr().cast()) } == 0 {
                 return Ok(fs);
             }
             let e = os_error();
@@ -176,6 +167,15 @@ mod sys {
         Ok(mounts()?.iter().any(|m| m.mount_point == path))
     }
 
+    /// Whether writes to the filesystem containing `path` are disabled.
+    pub fn is_read_only(path: &Path) -> Result<bool> {
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(cstr(path)?.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(os_error()).with_context(|| format!("read filesystem flags for {}", path.display()));
+        }
+        Ok(unsafe { stat.assume_init() }.f_flag & libc::ST_RDONLY != 0)
+    }
+
     /// Every mount by its id, which no other mount has while it stays, and
     /// where it is, in the order they were made.
     pub fn mount_ids() -> Result<Vec<(i32, PathBuf)>> {
@@ -197,7 +197,11 @@ mod sys {
     /// Mount what shows at `target` again with the flags it has, writable
     /// or read-only. Going read-only writes all it holds out first.
     pub fn remount_writable(target: &Path, writable: bool) -> Result<()> {
-        let st = super::statvfs(target).with_context(|| format!("look at the mount on {}", target.display()))?;
+        let c = cstr(target)?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return Err(os_error()).with_context(|| format!("look at the mount on {}", target.display()));
+        }
         let kept = [
             (libc::ST_NOSUID, libc::MS_NOSUID),
             (libc::ST_NODEV, libc::MS_NODEV),
@@ -469,6 +473,10 @@ mod sys {
         bail!("this host has no mount table to look up {}", path.display())
     }
 
+    pub fn is_read_only(path: &Path) -> Result<bool> {
+        bail!("this host has no filesystem flags to look up {}", path.display())
+    }
+
     pub fn visible(path: &Path) -> Result<Option<Visible>> {
         bail!("this host has no mount table to look up {}", path.display())
     }
@@ -495,13 +503,22 @@ mod sys {
 }
 
 pub use sys::{
-    bind, holders, holding, is_mount_point, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount,
+    bind, holders, holding, is_mount_point, is_read_only, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount,
     umount_detach, umount_detach_over, umount_over, visible,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_data_mounts_do_not_replay_logs_or_discard_blocks() {
+        let options = ["rw".into(), "discard".into(), "inlinecrypt".into()];
+        assert_eq!(read_only_options("f2fs", &options).unwrap(), ["inlinecrypt", "ro", "norecovery"]);
+        assert_eq!(read_only_options("ext4", &options).unwrap(), ["inlinecrypt", "ro", "noload"]);
+        assert_eq!(read_only_options("erofs", &[]).unwrap(), ["ro"]);
+        assert!(read_only_options("unknown", &options).is_err());
+    }
 
     #[test]
     fn the_kernels_flags_are_taken_out_of_a_phones_mount_options() {
@@ -514,14 +531,5 @@ mod tests {
         assert_eq!(own, "discard,reserve_root=32768,resgid=1065,fsync_mode=nobarrier,inlinecrypt,gc_merge,atgc");
         let (flags, own) = split_options(&["ro".into(), "defaults".into(), String::new()]);
         assert_eq!((flags, own.as_str()), (1, ""), "read-only, and nothing for the filesystem");
-    }
-
-    #[test]
-    fn a_filesystems_room_is_all_of_it_what_is_free_and_what_is_left_for_others() {
-        let room = space(&std::env::temp_dir()).unwrap();
-        assert!(room.total > 0);
-        assert!(room.total >= room.free && room.free >= room.available, "{room:?}");
-        assert_eq!(space(Path::new("/no/such/folder")).unwrap_err().kind(), io::ErrorKind::NotFound);
-        assert_eq!(space(Path::new("/tmp/a\0b")).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 }
