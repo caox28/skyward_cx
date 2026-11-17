@@ -1,10 +1,3 @@
-# Initial profile from read-only stock inspection on 2026-11-12:
-# OS4.0.6.0.XPMCNXM, framework 17/API37, vendor 16/API36.
-# Native recovery boot/touch and StrongBox startup were tested on myron.
-# Native Weaver getConfig passed (64 slots, 16-byte keys/values).
-# Read-only PIN/CE passed in 34fe498; later native rounds passed writable
-# data/sdcard, mount switches and physical controls. See myron-validation.json.
-# See myron.md, including the Java OMAPI dependency of stock Weaver.
 [device]
 codename = "myron"
 brand = "Redmi"
@@ -14,92 +7,65 @@ soc = { hans = "第五代骁龙®8至尊版移动平台", hant = "Snapdragon® 8
 os_version_prop = "ro.mi.os.version.incremental"
 
 [display]
-# Live DRM modes and persist.sys.miui_resolution agree on this size/DPI.
 width = 1200
 height = 2608
 density = 480
-
-# PIN/CE and writable filesystem access passed bounded native tests.
-# Keep fsck, general key upgrades and automatic key deletion off.
-[decrypt]
-read_only = false
-auto_repair = false
-key_upgrades = false
-# 759d4d2's single native test converted the inner storage blob successfully.
-# Keep outer/credential upgrades forbidden; the original disk blobs are kept.
-storage_key_renewal = true
+diagonal = 6.9
+# The radius the stock settings round a page's corners to as it slides in.
+corner_radius = 170
 
 [modules]
 sources = ["vendor_boot", "vendor_dlkm", "vendor", "system_dlkm"]
-# The touchscreen: FocalTech's, over SPI behind Xiaomi's touch layer, the
-# one touch driver the phone's own modules.load lists.
-# QTI eSE registered without its chip when /dev/nq-nci was absent. The
-# normal system's loaded nxp_nci build-id matches this stock module file.
-load = ["focaltech_touch_3683", "nxp-nci"]
+# The touchscreen: Synaptics TouchComm over SPI, behind Xiaomi's touch
+# layer, whose input device the touches come in on. Its firmware is read
+# from /odm/firmware.
+load = ["focaltech_touch_3683"]
 
-# Stock /vendor/etc/ueventd.rc gives this node to NFC. A newly loaded
-# recovery module must get those permissions before the eSE HAL opens it.
-[[owners]]
-user = "nfc"
-group = "nfc"
-mode = 0o660
-paths = ["/dev/nq-nci"]
+# The driver resets the touch controller as it connects to it, and the
+# controller comes back sending only raw frames, which the system's touch
+# algorithm turns into touches: Xiaomi's touch feature service runs it from
+# /odm/lib64/libtouchreport.so, and a recovery runs none of it. Told
+# through Xiaomi's touch layer, the driver has the controller report
+# positions itself, and has it do so again each time it wakes the
+# controller.
+[touch]
+writes = [{ path = "/sys/class/touch/touch_dev/enable_touch_raw", value = "0" }]
 
-# Stock has focaltech_ts, enable_touch_raw=1 and libtouchreport_alg_fts.so.
-# There is no evidence yet that FocalTech supports the Synaptics raw=0
-# workaround. Leave that write out until its position-reporting path is
-# checked. Stock's touchfeature service below loads libtouchreport.so,
-# libtouchreport_alg.so and libtouchreport_hal.so to process raw frames.
-
-# These files exist on this phone and its touchfeature rc assigns them to
-# system. Keep the observed device mode separate from the sysfs modes.
-[[owners]]
-user = "system"
-group = "system"
-mode = 0o666
-paths = ["/dev/xiaomi-touch"]
-
-[[owners]]
-user = "system"
-group = "system"
-mode = 0o664
-paths = [
-    "/sys/class/touch/touch_dev/enable_touch_raw",
-    "/sys/class/touch/touch_dev/resolution_factor",
-    "/sys/class/touch/touch_dev/touch_thp_ic_cmd",
-    "/sys/class/touch/touch_dev/touch_thp_ic_cmd_data",
-    "/sys/class/touch/touch_dev/touch_finger_status",
-    "/sys/class/touch/touch_dev/abnormal_event",
-    "/sys/class/touch/touch_dev/palm_sensor",
-    "/sys/class/touch/touch_dev/palm_sensor_1",
-    "/sys/class/touch/touch_dev/touch_ic_buffer",
-    "/sys/class/touch/touch_dev/fod_press_status",
-    "/sys/class/touch/touch_dev/weak_doubletap_sensor",
-]
-
-# The firmware of the WLAN chip is on the modem partition, which the phone
+# The firmware of the WLAN chip, and the apps the secure world loads for the
+# secure element's service, are on the modem partition, which the phone
 # mounts at /vendor/firmware_mnt and its own recovery leaves unmounted.
 [firmware]
 partition = "modem"
 
 # The persist partition, which the phone mounts at /mnt/vendor/persist and
-# its own recovery leaves unmounted. The WLAN's MAC address is there.
+# its own recovery leaves unmounted. The secure world keeps its own files
+# there, through a listener qseecomd registers: among them what the key
+# service needs to use a key that cannot be rolled back, such as the one
+# guarding each user's secret. The WLAN's MAC address is there as well.
 [partitions]
 mounted = ["persist"]
 
-# Its stock recovery leaves out libsysutils and libcap, which the
-# recovery's own logd loads, as the 17 Ultra's does.
+# The recovery's own logd loads libsysutils and libcap, which the stock
+# recovery leaves out, so it ends as soon as init starts it, init starts it
+# again every five seconds, and nothing the phone's own programs log is
+# kept. The installed system carries both, built from the same sources.
 [logd]
 libraries = ["/mnt/system/system/lib64/libsysutils.so", "/mnt/system/system/lib64/libcap.so"]
 
-# What the phone's own init runs once the system has finished starting, as
-# kernel-post-boot in /vendor/etc/init/hw/init.qti.kernel.rc. The kernel
-# starts both CPU clusters on the performance governor, which holds them at
-# their highest clock, and Qualcomm's idle driver keeps idle CPUs from
-# powering down until it is told otherwise; the script hands the clusters
-# to WALT, lets idle CPUs power down and sets how the memory bus scales.
-# Without it the CPUs stay at their highest clock and voltage even while
-# idle, and the phone slowly heats up.
+# Each of the phone's own programs below runs as the user, in the groups
+# and with the capabilities its init script on the phone gives it, so that
+# what it makes in the data partition is whose it is when the phone runs
+# it, and the phone's own copy of it can still read and remove it.
+
+# What the phone's own init runs once the system has finished starting.
+# The kernel starts both CPU clusters on the performance governor, which
+# holds them at their highest clock, and Qualcomm's idle driver keeps idle
+# CPUs from powering down until it is told otherwise; the script hands the
+# clusters to WALT, lets idle CPUs power down and sets how the memory bus
+# scales. Without it the CPUs stay at their highest clock and voltage even
+# while idle, and the phone slowly heats up. It needs none of the programs
+# below and runs before them, so one of them that does not come up still
+# leaves the CPUs settled.
 [[service]]
 path = "/vendor/bin/sh"
 args = ["/vendor/bin/init.kernel.post_boot.sh"]
@@ -108,25 +74,8 @@ oneshot = true
 user = "root"
 groups = ["root", "system", "wakelock", "graphics"]
 
-# The paths, accounts and capabilities below are from this phone's
-# OS4.0.6.0 vendor/odm init files, not the 17 Ultra's service list.
-# Start the observed AIDL boot control before the untested security chain
-# so its readiness is not gated on a later KeyMint/Weaver failure.
-[[service]]
-path = "/vendor/bin/hw/android.hardware.boot-service.qti"
-libraries = ["/system/lib64", "/vendor/lib64"]
-ready_service = "android.hardware.boot.IBootControl/default"
-user = "root"
-groups = ["root"]
-
-[[service]]
-path = "/odm/bin/hw/vendor.xiaomi.hw.touchfeature-service"
-libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
-ready_service = "vendor.xiaomi.hw.touchfeature.ITouchFeature/default"
-user = "system"
-groups = ["system", "input"]
-capabilities = ["SYS_NICE"]
-
+# The secure world reaches back into Android through the listeners this
+# daemon registers; without them the key service cannot use any key.
 [[service]]
 path = "/vendor/bin/qseecomd"
 libraries = ["/system/lib64", "/vendor/lib64"]
@@ -134,6 +83,9 @@ ready_property = "vendor.sys.listeners.registered"
 user = "root"
 groups = ["root", "drmrpc"]
 
+# The opener the secure world's apps are reached through by programs that
+# speak to them as GlobalPlatform's TEE client does, which loads those apps
+# from /vendor/firmware_mnt/image as they are first asked for.
 [[service]]
 path = "/vendor/bin/hlosminkdaemon"
 libraries = ["/system/lib64", "/vendor/lib64"]
@@ -141,18 +93,9 @@ user = "system"
 groups = ["system", "oem_2912", "wakelock"]
 capabilities = ["WAKE_ALARM", "BLOCK_SUSPEND"]
 
-# The QTI native process, not the NXP NFC process, owns eSE1 on this phone.
-# libEseUtils is in vendor/lib64/hw. libhardware needs libvndksupport and
-# its bootstrap libdl_android dependency, absent from the stock ramdisk.
-[[service]]
-path = "/vendor/bin/hw/android.hardware.secure_element-service.qti"
-libraries = ["/system/lib64", "/vendor/lib64", "/vendor/lib64/hw", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
-ready_service = "android.hardware.secure_element.ISecureElement/eSE1"
-registers = ["android.hardware.secure_element.ISecureElement/SIM1", "android.hardware.secure_element.ISecureElement/SIM2"]
-user = "system"
-groups = ["nfc", "system"]
-
-# All four QTI interfaces were confirmed in VINTF and stock service list.
+# The key service, which is the only thing that can use the keys the phone
+# wrapped in hardware. The same program serves the secure clock and the
+# shared secret, which the phone describes apart from it.
 [[service]]
 path = "/vendor/bin/hw/android.hardware.security.onekeymint-service-qti"
 libraries = ["/system/lib64", "/vendor/lib64"]
@@ -165,6 +108,9 @@ registers = [
 user = "system"
 groups = ["system", "drmrpc"]
 
+# The credential service: it is what the secure world has check the secret
+# behind a screen lock, and the only thing that can hand out the note the
+# key service wants before it will use a key that secret guards.
 [[service]]
 path = "/vendor/bin/hw/android.hardware.gatekeeper-rust-service-qti"
 libraries = ["/system/lib64", "/vendor/lib64"]
@@ -172,43 +118,68 @@ ready_service = "android.hardware.gatekeeper.IGatekeeper/default"
 user = "system"
 groups = ["system"]
 
-# NXP StrongBox uses HalToHalTransport to native eSE1. Its separate shared
-# secret participates in the notes-key agreement alongside QTI's default.
-# Stock's rc sets only the UID; /proc confirms primary GID 0.
+# The weaver, in the secure element of the builds whose odm properties set
+# ro.special_edition: Goodix's, behind its own service, which reaches it
+# through the secure world. Every user's secret is bound to a slot of it,
+# with a screen lock or without. The phone's init puts the description of
+# what the secure element's service registers in place of an empty one on
+# those builds. Both programs load the vendor partition's libhardware,
+# which asks for the installed system's libvndksupport, and that for its
+# libdl_android, of which only the copy in bootstrap is a file rather than
+# a link into a bundle; the installed system's libraries come last, so only
+# these two are taken from them. The other builds keep their weaver in a
+# Thales secure element, which its service reaches only through Android's
+# own OMAPI service, and a recovery runs none of Android's framework.
 [[service]]
-path = "/odm/bin/hw/android.hardware.security.keymint3-service.strongbox.nxp"
+path = "/odm/bin/hw/android.hardware.secure_element-service-goodix"
 libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
-# File capabilities trigger AT_SECURE, so missing dependencies must be in
-# the REC's normal RAM search path, not just in LD_LIBRARY_PATH. These two
-# installed 4.0.6 files' imports/versions match the exact REC/linker.
-recovery_libraries = [
-    { source = "/mnt/system/system/lib64/libvndksupport.so", sha256 = "24a35b4ca97ebb2fd8cab02baf8d4e3af49ceb7309c93268e5670eda3930d112" },
-    { source = "/mnt/system/system/lib64/bootstrap/libdl_android.so", sha256 = "6ad8ee8bc0a67a2582f9a9bcc37a40af4aa21236b968a08a895099058066305a" },
-]
-ready_service = "android.hardware.security.keymint.IKeyMintDevice/strongbox"
-registers = ["android.hardware.security.keymint.IRemotelyProvisionedComponent/strongbox", "android.hardware.security.sharedsecret.ISharedSecret/strongbox"]
-user = "vendor_nxp_strongbox"
+ready_service = "android.hardware.secure_element.ISecureElement/eSE1"
+registers = ["vendor.goodix.hardware.secure_element_aidl.IGdxEse/default"]
+description = "/odm/etc/secure_element-service-goodixsp.xml"
+when = { property = "ro.special_edition", value = "true" }
+user = "system"
+groups = ["system"]
+
+[[service]]
+path = "/system/bin/se_omapi"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.se.omapi.ISecureElementService/default"
+user = "root"
+groups = ["root", "system"]
+
+[[service]]
+path = "/system/tee/weaver-service"
+libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
+ready_service = "android.hardware.weaver.IWeaver/default"
+description = "/odm/etc/vintf/manifest/android.hardware.weaver-service.nxp.xml"
+user = "root"
+groups = ["root", "system"]
+capabilities = ["WAKE_ALARM"]
+
+# The boot control, which says which slot the bootloader starts next and
+# switches it, writing where the bootloader reads it. It comes last: the
+# phone is usable without it.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.boot-service.qti"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.boot.IBootControl/default"
+user = "root"
 groups = ["root"]
 
-# This is NXP Weaver2, not the conditional Goodix service on nezha.
-# Its account is 2911 in the installed vendor passwd/group files.
-# Its stock ese_weaver.so uses Java OMAPI. Preserve the executable/filecaps
-# and bind the native replacement only in this child's private namespace.
-# Confirm the actual mapped inode/hash before any read-only getConfig.
-[[service]]
-path = "/odm/bin/hw/android.hardware.weaver-service.nxp-qti"
-libraries = ["/system/lib64", "/vendor/lib64", "/odm/lib64", "/mnt/system/system/lib64", "/mnt/system/system/lib64/bootstrap"]
-library_overrides = [{ source = "/skyward/lib64/ese_weaver.so", target = "/odm/lib64/ese_weaver.so" }]
-ready_service = "android.hardware.weaver.IWeaver/default"
-# This stock fragment spells interface/instance separately, so the generic
-# fqname text filter misses it. Publish the actual fragment explicitly.
-description = "/odm/etc/vintf/manifest/android.hardware.weaver-service.nxp.xml"
-user = "vendor_nxp_weaver"
-groups = ["vendor_nxp_weaver"]
-
-# Stock actually loads qca_cld3_peach_v2, has a qcom,cnss-peach sysfs
-# device, and carries /vendor/etc/wifi/peach_v2. Native hotspot scanning
-# passed; an earlier recovery log also recorded DHCP and reachability.
+# WLAN: Qualcomm's Peach on PCIe, driven by qca_cld3_peach_v2 over the
+# cnss2 platform driver. The vendor's cfg80211 asks for rfkill, one of the
+# kernel's own modules in system_dlkm, which the system loads before any of
+# the vendor's and a recovery leaves out. Once fs_ready is written, cnss2
+# powers the chip up and loads its firmware from the modem partition, and
+# wlan0 appears. The driver reads its settings and the MAC address through
+# the firmware loader, from links the vendor partition keeps in its own
+# firmware folder, into the vendor partition and into persist.
+# wpa_supplicant runs on the recovery's own libraries before the vendor
+# partition's: the vendor partition carries its own copies of the lowest of
+# them, and a program loading those would not be understood by the
+# recovery's service directory. Whether a network joined reaches the
+# internet is asked of the page the stock system's NetworkStack overlay
+# names, on the product partition.
 [wlan]
 modules = ["rfkill", "qca_cld3_peach_v2"]
 writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
@@ -222,16 +193,57 @@ probe = "http://connect.rom.miui.com/generate_204"
 [update]
 server = "https://update.miui.com/updates/miotaV3.php"
 
-# Official OTA payload manifest and the active stock recovery_b independently
-# agree on the complete 100 MiB image hash. CI also extracts and hashes it.
+# The stock build the recovery is made on: the Chinese system's OS4.0.6.0,
+# whose full update package on the phone maker's own download server holds
+# the recovery partition the recovery is built on top of.
 [stock]
 version = "OS4.0.6.0.XPMCNXM"
 package = "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS4.0.6.0.XPMCNXM/myron-ota_full-OS4.0.6.0.XPMCNXM-user-17.0-66564d402b.zip"
 recovery = "49622932fb32ab623db336866734ad440a2e15af5f750ceb9b1d3d0f7fdabafc"
 
-# qcom-hv-haptics (qcom,hv-haptics in its dtbo), with the click made from
-# samples at the motor's resonant frequency as on the 17 Ultra. The
-# strengths are the 17 Ultra's, which were felt on that phone's motor.
+# qcom-hv-haptics. The waveforms the driver keeps play nothing in a
+# recovery, though the driver loads and plays them without complaint, and
+# it would drive them at the period its device tree gives, 5555 µs, while
+# the motor swings at its own frequency, 172.4 Hz on one phone, which the
+# phone measures as it boots and the driver keeps. The click is made from
+# samples at that frequency instead, which the driver plays at up to the
+# 8500 mV its device tree gives samples. The system's own clicks feel as
+# one at a quarter of that does, lighter ones can hardly be felt, and past
+# three quarters the motor rattles.
 [haptics]
 resonance = "/sys/class/qcom-haptics/lra_frequency_hz"
 strength = { lightest = 0.25, strongest = 0.75 }
+
+# The partitions a backup of the baseband and EFS takes: the baseband's
+# settings, with the IMEI, and the sensors' calibration. And what of the
+# data partition a backup leaves out because the secure world keeps it in
+# step with itself: its own storage, its apps' data, that of Xiaomi's own
+# trusted environment, the secure element's state and the fingerprint
+# templates.
+[backup]
+efs = ["modemst1", "modemst2", "fsg", "fsc", "persist"]
+data_skipped = [
+    "vendor/tzstorage",
+    "vendor/qtee",
+    "vendor/mitee",
+    "vendor/goodix",
+    "vendor/fingerprint",
+    "vendor/fpdata",
+    "vendor/misc/mi_fp",
+]
+
+# Where the phone's own programs keep logs in the data partition: the
+# system's, the minidumps, what Xiaomi's log manager keeps of each part of
+# the phone, and what the modem, Wi-Fi and Bluetooth leave when they crash.
+[wipe]
+logs = [
+    "/data/miuilog",
+    "/data/vendor/diag",
+    "/data/vendor/bsplog",
+    "/data/vendor/log",
+    "/data/vendor/ramdump",
+    "/data/vendor/ramdump_ssr",
+    "/data/vendor/ssrdump",
+    "/data/vendor/tombstones",
+    "/data/vendor/wlan_logs",
+]

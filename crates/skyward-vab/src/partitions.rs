@@ -67,20 +67,9 @@ fn bytes(p: &Partition) -> u64 {
 }
 
 /// Map partition `p` from super read-only with device-mapper and mount it
-/// over its point. A mapping left in use by another mount namespace is
-/// reused only when its read-only table still matches this slot's metadata.
-/// A failed mount removes only a mapping created by this call.
+/// over its point. A device that does not mount is removed again.
 fn map_and_mount(p: &Partition, devices: &[(u32, u32)], slot: Slot) -> Result<Mounted> {
-    let table = targets(p, devices);
-    let (device, made) = match dm::status(&p.name)? {
-        Some(dev) => {
-            dm::verify_readonly_linear(&p.name, &table)?;
-            let device = PathBuf::from(format!("/dev/block/dm-{}", dev.1));
-            ensure!(devnum(&device)? == dev, "{} no longer names the expected mapped device", device.display());
-            (device, false)
-        }
-        None => (dm::create(&p.name, &table, true)?, true),
-    };
+    let device = dm::create(&p.name, &targets(p, devices), true)?;
     let mount_point = mount_point(base(p, slot));
     let mounted = (|| -> Result<String> {
         fs::create_dir_all(&mount_point).with_context(|| format!("create {}", mount_point.display()))?;
@@ -88,7 +77,6 @@ fn map_and_mount(p: &Partition, devices: &[(u32, u32)], slot: Slot) -> Result<Mo
     })();
     match mounted {
         Ok(filesystem) => Ok(Mounted { partition: p.name.clone(), device, mount_point, filesystem }),
-        Err(e) if !made => Err(e),
         Err(e) => Err(match dm::remove(&p.name) {
             Ok(()) => e,
             Err(r) => e.context(format!("removing {} afterwards failed too: {r:#}", p.name)),
@@ -359,13 +347,17 @@ fn unmap(name: &str, point: &Path) -> Result<()> {
     snapshots::unmap_snapshot(name)
 }
 
-/// Unmount one logical partition from this view. Its mapping stays: another
-/// service's private mount namespace may still use it, and a snapshot may
-/// still be merging. Full update cleanup uses the stricter unmap path.
+/// Unmount one of the slot's logical partitions by its base name and remove
+/// its device-mapper device. One that reads through a snapshot is only
+/// unmounted: its snapshot stays mapped, for its merge to go on and for it
+/// to be mounted again.
 pub fn unmount_one(slot: Slot, base_name: &str) -> Result<()> {
     let name = format!("{base_name}{}", slot.suffix());
     let point = mount_point(base_name);
-    let Some(dev) = dm::status(&name)? else { return Ok(()) };
+    if !snapshots::is_snapshot(&name)? {
+        return unmap(&name, &point);
+    }
+    let dev = dm::status(&name)?.with_context(|| format!("{name} is not mapped"))?;
     if mount::visible(&point)?.is_some_and(|v| v.device == dev) {
         mount::umount_over(&point)?;
     }
